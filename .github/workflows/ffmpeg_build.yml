@@ -1,0 +1,222 @@
+name: Build Mini Audio FFmpeg (MP3 <-> WAV) with JNI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-so-libs:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [arm64-v8a, armeabi-v7a]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Android NDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential yasm nasm cmake git make zip
+
+    - name: Download FFmpeg Source
+      run: |
+        git clone --depth 1 --branch release/6.0 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+
+    - name: Build Audio-Only FFmpeg so
+      run: |
+        cd ffmpeg-src
+        NDK_PATH=$ANDROID_NDK_HOME
+        TOOLCHAIN=$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64
+        API=24
+        
+        if [ "${{ matrix.architecture }}" = "arm64-v8a" ]; then
+          ARCH="aarch64"
+          CPU="armv8-a"
+          CROSS_PREFIX="$TOOLCHAIN/bin/aarch64-linux-android-"
+          CC="$TOOLCHAIN/bin/aarch64-linux-android$API-clang"
+          CXX="$TOOLCHAIN/bin/aarch64-linux-android$API-clang++"
+        else
+          ARCH="arm"
+          CPU="armv7-a"
+          CROSS_PREFIX="$TOOLCHAIN/bin/arm-linux-androideabi-"
+          CC="$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang"
+          CXX="$TOOLCHAIN/bin/armv7a-linux-androideabi$API-clang++"
+        fi
+
+        # Android 15 (16KB Page Size) Compatibility
+        export LDFLAGS="-Wl,-z,max-page-size=16384"
+
+        # শুধুমাত্র MP3 এবং WAV (PCM) কনফিগারেশন
+        ./configure \
+          --cross-prefix=$CROSS_PREFIX \
+          --sysroot=$TOOLCHAIN/sysroot \
+          --target-os=android \
+          --arch=$ARCH \
+          --cpu=$CPU \
+          --enable-cross-compile \
+          --enable-shared \
+          --disable-static \
+          --disable-doc \
+          --enable-ffmpeg \
+          --disable-ffplay \
+          --disable-ffprobe \
+          --disable-avdevice \
+          --disable-swscale \
+          --disable-postproc \
+          --disable-avfilter \
+          --disable-everything \
+          --disable-vulkan \
+          --disable-hwaccels \
+          --disable-vdpau \
+          --enable-avcodec \
+          --enable-avformat \
+          --enable-swresample \
+          --enable-decoder=mp3,pcm_s16le,pcm_s24le,pcm_s32le \
+          --enable-encoder=libmp3lame,pcm_s16le \
+          --enable-parser=mpegaudio \
+          --enable-demuxer=mp3,wav \
+          --enable-muxer=mp3,wav \
+          --enable-protocol=file \
+          --cc=$CC \
+          --cxx=$CXX \
+          --enable-neon \
+          --extra-ldflags="$LDFLAGS"
+
+        make -j4
+        
+        mkdir -p ../output/${{ matrix.architecture }}
+        cp libavcodec/libavcodec.so ../output/${{ matrix.architecture }}/
+        cp libavformat/libavformat.so ../output/${{ matrix.architecture }}/
+        cp libswresample/libswresample.so ../output/${{ matrix.architecture }}/
+        cp libavutil/libavutil.so ../output/${{ matrix.architecture }}/
+
+        # CLI main ফাংশন রিনেম করা (যাতে JNI থেকে কল করা যায়)
+        sed -i 's/int main(/int ffmpeg_main(/g' fftools/ffmpeg.c
+
+        # JNI কোড জেনারেট করা
+        cat << 'EOF' > ffmpeg_jni.c
+        #include <jni.h>
+        #include <string.h>
+        #include <stdlib.h>
+        #include <android/log.h>
+
+        #define LOG_TAG "FFmpeg_Native"
+        #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+        int ffmpeg_main(int argc, char **argv);
+
+        JNIEXPORT jint JNICALL
+        Java_com_tonmoy_ffmpeg_audio_FFmpeg_execute(JNIEnv *env, jclass clazz, jobjectArray cmd_array) {
+            int argc = (*env)->GetArrayLength(env, cmd_array);
+            char **argv = (char **)malloc(sizeof(char *) * argc);
+            
+            for (int i = 0; i < argc; i++) {
+                jstring string = (jstring)(*env)->GetObjectArrayElement(env, cmd_array, i);
+                const char *rawString = (*env)->GetStringUTFChars(env, string, 0);
+                argv[i] = strdup(rawString);
+                (*env)->ReleaseStringUTFChars(env, string, rawString);
+            }
+            
+            LOGI("Executing MP3/WAV FFmpeg Command...");
+            int result = ffmpeg_main(argc, argv);
+            LOGI("Execution finished with code: %d", result);
+            
+            for (int i = 0; i < argc; i++) {
+                free(argv[i]);
+            }
+            free(argv);
+            
+            return result;
+        }
+        EOF
+
+        # fftools সোর্স ফাইল সহ JNI লাইব্রেরি কম্পাইল করা
+        $CC -shared -fPIC ffmpeg_jni.c \
+          fftools/ffmpeg.c fftools/ffmpeg_opt.c fftools/ffmpeg_mux.c fftools/ffmpeg_demux.c fftools/cmdutils.c fftools/opt_common.c \
+          -o ../output/${{ matrix.architecture }}/libffmpeg_jni.so \
+          -I. -I./fftools \
+          -I$TOOLCHAIN/sysroot/usr/include \
+          -L../output/${{ matrix.architecture }} -lavformat -lavcodec -lswresample -lavutil -llog -lm -lz
+
+    - name: Upload Temporary SO Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: so-libs-${{ matrix.architecture }}
+        path: output/${{ matrix.architecture }}/
+
+  build-pure-aar:
+    runs-on: ubuntu-latest
+    needs: build-so-libs
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Manual AAR Packaging with Command Executor
+      run: |
+        mkdir -p aar-package/jni/arm64-v8a
+        mkdir -p aar-package/jni/armeabi-v7a
+        mkdir -p java-build/com/tonmoy/ffmpeg/audio
+        
+        cat << 'EOF' > aar-package/AndroidManifest.xml
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.tonmoy.ffmpeg.audio"></manifest>
+        EOF
+
+        touch aar-package/R.txt
+
+        cat << 'EOF' > java-build/com/tonmoy/ffmpeg/audio/FFmpeg.java
+        package com.tonmoy.ffmpeg.audio;
+        public class FFmpeg {
+            static {
+                System.loadLibrary("avutil");
+                System.loadLibrary("swresample");
+                System.loadLibrary("avcodec");
+                System.loadLibrary("avformat");
+                System.loadLibrary("ffmpeg_jni"); 
+            }
+            public static native int execute(String[] cmd);
+        }
+        EOF
+
+        # রিলিজ টার্গেট জাভা ৮ করে দেওয়া হয়েছে ব্যাকওয়ার্ড কম্প্যাটিবিলিটির জন্য
+        javac --release 8 java-build/com/tonmoy/ffmpeg/audio/FFmpeg.java
+        cd java-build
+        jar cvf ../aar-package/classes.jar com/
+        cd ..
+
+    - name: Download arm64-v8a SO
+      uses: actions/download-artifact@v4
+      with:
+        name: so-libs-arm64-v8a
+        path: aar-package/jni/arm64-v8a
+
+    - name: Download armeabi-v7a SO
+      uses: actions/download-artifact@v4
+      with:
+        name: so-libs-armeabi-v7a
+        path: aar-package/jni/armeabi-v7a
+
+    - name: Generate Standard .AAR File
+      run: |
+        cd aar-package
+        zip -r ../ffmpeg-audio-release.aar .
+
+    - name: Upload Final AAR Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ffmpeg-audio-aar
+        path: ffmpeg-audio-release.aar
